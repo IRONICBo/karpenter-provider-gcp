@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/patrickmn/go-cache"
 	"google.golang.org/api/compute/v1"
 	"google.golang.org/api/googleapi"
 	"k8s.io/utils/ptr"
@@ -35,6 +36,10 @@ import (
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils"
 )
 
+const (
+	instanceCacheExpiration = 15 * time.Second
+)
+
 type Provider interface {
 	Create(context.Context, *v1alpha1.GCENodeClass, *karpv1.NodeClaim, []*cloudprovider.InstanceType) (*Instance, error)
 	Get(context.Context, string) (*Instance, error)
@@ -44,6 +49,8 @@ type Provider interface {
 }
 
 type DefaultProvider struct {
+	instanceCache *cache.Cache
+
 	region         string
 	projectID      string
 	computeService *compute.Service
@@ -51,6 +58,7 @@ type DefaultProvider struct {
 
 func NewProvider(region, projectID string, computeService *compute.Service) *DefaultProvider {
 	return &DefaultProvider{
+		instanceCache:  cache.New(instanceCacheExpiration, instanceCacheExpiration),
 		region:         region,
 		projectID:      projectID,
 		computeService: computeService,
@@ -340,8 +348,36 @@ func (p *DefaultProvider) Delete(ctx context.Context, providerID string) error {
 }
 
 func (p *DefaultProvider) CreateTags(ctx context.Context, providerID string, tags map[string]string) error {
-	// TODO: Implement me
-	return nil
+	ecsTags := make([]*ecsclient.AddTagsRequestTag, 0, len(tags))
+	for k, v := range tags {
+		ecsTags = append(ecsTags, &ecsclient.AddTagsRequestTag{
+			Key:   tea.String(k),
+			Value: tea.String(v),
+		})
+	}
+
+	addTagsRequest := &ecsclient.AddTagsRequest{
+		RegionId:     tea.String(p.region),
+		ResourceType: tea.String("instance"),
+		ResourceId:   tea.String(id),
+		Tag:          ecsTags,
+	}
+
+	runtime := &util.RuntimeOptions{}
+	if _, err := p.ecsClient.AddTagsWithOptions(addTagsRequest, runtime); err != nil {
+		if alierrors.IsNotFound(err) {
+			return cloudprovider.NewNodeClaimNotFoundError(fmt.Errorf("tagging instance, %w", err))
+		}
+		return fmt.Errorf("tagging instance, %w", err)
+	}
+
+	instances, err := p.list(ctx)
+	if err != nil {
+		return err
+	}
+	p.syncAllInstances(instances)
+
+	return err
 }
 
 func parseGCEProviderID(providerID string) (project, zone, instance string, err error) {
@@ -367,4 +403,10 @@ func isInstanceNotFoundError(err error) bool {
 		return apiErr.Code == 404
 	}
 	return false
+}
+
+func (p *DefaultProvider) syncAllInstances(instances []*Instance) {
+	for _, instance := range instances {
+		p.instanceCache.Set(instance.InstanceID, instance, cache.DefaultExpiration)
+	}
 }
