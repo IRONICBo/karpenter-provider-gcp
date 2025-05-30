@@ -217,10 +217,7 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 		return nil, err
 	}
 
-	var diversityInstanceType bool
-	if v, ok := nodePool.Labels[CloudPilotDiversityInstanceTypeLabelKey]; ok {
-		diversityInstanceType, _ = strconv.ParseBool(v)
-	}
+	diversityInstanceType, _ := strconv.ParseBool(nodePool.Labels[CloudPilotDiversityInstanceTypeLabelKey])
 
 	if !diversityInstanceType {
 		return instanceTypes, nil
@@ -243,82 +240,90 @@ func (c *CloudProvider) filterInstanceTypesByMaxSpotInstanceType(
 	ctx context.Context,
 	instanceTypes []*cloudprovider.InstanceType,
 ) ([]*cloudprovider.InstanceType, error) {
-	type instanceTypeCount struct {
-		instanceType  string
-		createTimeNum int64
-		count         int
-	}
-
-	// If there's only one or zero instance types, there's nothing to filter
 	if len(instanceTypes) < 2 {
 		return instanceTypes, nil
 	}
 
-	// Fetch all NodeClaims to analyze current Spot usage
+	usageMap, err := c.getSpotInstanceTypeUsage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if len(usageMap) == 0 {
+		return instanceTypes, nil
+	}
+
+	maxUsed := mostUsedSpotInstanceType(usageMap)
+	if maxUsed == nil {
+		return instanceTypes, nil
+	}
+
+	disableSpotOfferings(instanceTypes, maxUsed.instanceType)
+
+	return instanceTypes, nil
+}
+
+type instanceTypeCount struct {
+	instanceType       string
+	oldestCreationTime time.Time
+	count              int
+}
+
+func (c *CloudProvider) getSpotInstanceTypeUsage(ctx context.Context) (map[string]*instanceTypeCount, error) {
 	nodeClaimList := &karpv1.NodeClaimList{}
 	if err := c.kubeClient.List(ctx, nodeClaimList); err != nil {
 		return nil, fmt.Errorf("listing nodeclaims, %w", err)
 	}
 
-	existingSpotInstanceTypeM := make(map[string]*instanceTypeCount)
-
-	// Aggregate count and creation time of Spot NodeClaims per instance type
+	result := make(map[string]*instanceTypeCount)
 	for i := range nodeClaimList.Items {
+		// Early check for both required labels
 		nc := nodeClaimList.Items[i]
-		capacityType, ok := nc.Labels[karpv1.CapacityTypeLabelKey]
-		if !ok || capacityType != karpv1.CapacityTypeSpot {
+		instanceType := nc.Labels[corev1.LabelInstanceTypeStable]
+		capacityType := nc.Labels[karpv1.CapacityTypeLabelKey]
+		if capacityType != karpv1.CapacityTypeSpot || instanceType == "" {
 			continue
 		}
 
-		instanceType, ok := nc.Labels[corev1.LabelInstanceTypeStable]
-		if !ok || instanceType == "" {
-			continue
-		}
-
-		if stat, exists := existingSpotInstanceTypeM[instanceType]; exists {
+		if stat, exists := result[instanceType]; exists {
 			stat.count++
-			// Add creation time for tie-breaking
-			stat.createTimeNum += nc.CreationTimestamp.Unix()
+			stat.oldestCreationTime = nc.CreationTimestamp.Time
 		} else {
-			existingSpotInstanceTypeM[instanceType] = &instanceTypeCount{
-				instanceType:  instanceType,
-				createTimeNum: nc.CreationTimestamp.Unix(),
-				count:         1,
+			result[instanceType] = &instanceTypeCount{
+				instanceType:       instanceType,
+				oldestCreationTime: nc.CreationTimestamp.Time,
+				count:              1,
 			}
 		}
 	}
+	return result, nil
+}
 
-	// No spot instance types currently used, return original list
-	if len(existingSpotInstanceTypeM) == 0 {
-		return instanceTypes, nil
+func mostUsedSpotInstanceType(stats map[string]*instanceTypeCount) *instanceTypeCount {
+	if len(stats) == 0 {
+		return nil
 	}
-
-	// Determine the most frequently used Spot instance type
-	maxInstanceType := lo.MaxBy(lo.Values(existingSpotInstanceTypeM), func(a, b *instanceTypeCount) bool {
+	return lo.MaxBy(lo.Values(stats), func(a, b *instanceTypeCount) bool {
 		if a.count > b.count {
 			return true
 		}
 		if a.count == b.count {
-			return a.createTimeNum < b.createTimeNum // prefer older
+			return a.oldestCreationTime.Before(b.oldestCreationTime)
 		}
 		return false
 	})
+}
 
-	// Disable Spot offerings for the most used instance type
+func disableSpotOfferings(instanceTypes []*cloudprovider.InstanceType, instanceTypeName string) {
 	for _, it := range instanceTypes {
-		if it.Name != maxInstanceType.instanceType {
+		if it.Name != instanceTypeName {
 			continue
 		}
-
 		for i := range it.Offerings {
-			req := it.Offerings[i].Requirements
-			if req.Get(karpv1.CapacityTypeLabelKey).Has(karpv1.CapacityTypeSpot) {
+			if it.Offerings[i].Requirements.Get(karpv1.CapacityTypeLabelKey).Has(karpv1.CapacityTypeSpot) {
 				it.Offerings[i].Available = false
 			}
 		}
 	}
-
-	return instanceTypes, nil
 }
 
 func (c *CloudProvider) resolveNodeClassFromNodePool(ctx context.Context, nodePool *karpv1.NodePool) (*v1alpha1.GCENodeClass, error) {
